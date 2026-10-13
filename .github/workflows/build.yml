@@ -61,8 +61,10 @@ jobs:
             # serial de proposito: "make -j" tem corrida entre sub-makes
             make '"$TARGET"' RA_LAUNCHER_WIFI=2
             # Prova tirada do binario: um launcher com rede liga o dsiwifi no ARM7.
+            # Le os nomes de simbolos direto do ELF com grep, sem depender do "nm"
+            # (que nao esta no PATH nesta imagem).
             ELF=$(ls retail/arm7/*.elf | head -n1)
-            WIFI=$(arm-none-eabi-nm "$ELF" | grep -ci "dsiwifi\|wifi_" || true)
+            WIFI=$(grep -ao "[A-Za-z0-9_]*[Ww][Ii][Ff][Ii]_[A-Za-z0-9_]*" "$ELF" | sort -u | wc -l)
             echo "ARM7 wifi symbols: $WIFI ($ELF)"
             if [ "$WIFI" -lt 20 ]; then
               echo "ERRO: este NAO e um build com rede (RA_LAUNCHER_WIFI=2)"; exit 1
