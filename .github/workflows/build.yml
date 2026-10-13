@@ -11,88 +11,92 @@ on:
       - 'README.md'
   release:
     types: [created]
+  workflow_dispatch:   # permite rodar manualmente: aba Actions > Run workflow
+
+env:
+  # Este projeto usa libnds 1.8.0 (nds/fifocommon.h, nds/fifomessages.h,
+  # nds/arm7/clock.h, sec_t). O libnds 2.x removeu tudo isso, entao a imagem
+  # "latest" NAO compila. Esta tag e a ultima conhecida com libnds 1.8.0.
+  DEVKITARM_IMAGE: devkitpro/devkitarm:20241104
 
 jobs:
   build:
+    # Roda direto no runner Ubuntu (e NAO dentro de "container:"), de proposito.
+    # Antes o job rodava dentro da imagem devkitarm e precisava de "apt-get install gcc p7zip"
+    # numa imagem Debian 11 cujos repositorios ja nao servem pacotes (erro 404).
+    # Agora o gcc do host compila o lzss e roda os testes; so o "make" roda no Docker.
     runs-on: ubuntu-latest
-    # Unpinned, deliberately, and it is the lesser of two evils.
-    #
-    # This was pinned to devkitpro/devkitarm:20241104 and had never once gone green in this repo:
-    # four runs, four failures, all of them `apt-get install` dying on a 404 for linux-libc-dev.
-    # Nothing to do with the code -- that image is bullseye, Debian 11 has moved to LTS, and the
-    # security pool it points at no longer serves the package version its index names. A pin that
-    # cannot install its own dependencies is not reproducibility, it is rot.
-    #
-    # So the image floats and the toolchain version is *printed* instead, which is this project's
-    # usual trade: do not try to prevent the unknown, make it visible in the log. Releases are not
-    # built here anyway -- tools/ra_release.sh builds those -- so a drift shows up as a margin
-    # changing in the report below rather than as a ROM nobody can reproduce.
-    container: devkitpro/devkitarm:latest
-    name: Build with Docker using devkitARM
+    name: Build with devkitARM (libnds 1.8.0)
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install tools
+
+      - name: Confere se os submodulos vieram
         run: |
-          # Retried, because the mirror being briefly out of step with its own index is exactly how
-          # this workflow spent its whole life failing. gcc is for lzss, which has to run on the
-          # host; p7zip-full is for packing the artifacts.
-          for i in 1 2 3; do
-            apt-get update && apt-get install -y --no-install-recommends p7zip-full gcc && break
-            echo "apt attempt $i failed; retrying"
-            sleep 10
-          done
-          gcc lzss.c -o /usr/local/bin/lzss
-      - name: Which toolchain this ran on
-        run: arm-none-eabi-gcc --version | head -1
-      - name: Setup environment
-        run: git config --global safe.directory '*'
-      # The reader's chain walker is pure address logic, so it can be checked here
-      # rather than by flashing a card. Runs before the build so a logic regression
-      # fails in seconds instead of after every cardengine variant has linked.
-      - name: Test the RA reader
+          ls retail/cardenginei/arm9_ra/rcheevos/include/rc_runtime.h
+          ls libs/dsiwifi | head -3
+
+      - name: Compila o lzss (host, estatico)
+        # Estatico para rodar dentro da imagem Debian 11 sem depender da glibc do host.
+        run: gcc -O2 -static lzss.c -o lzss
+
+      - name: Test the RA reader (host)
         run: ./tools/ra_reader_test.sh
-      - name: Build nightly
-        if: ${{ !startsWith(github.ref, 'refs/tags') }}
-        run: make package-nightly
-      - name: Build release
-        if: ${{ startsWith(github.ref, 'refs/tags') }}
-        run: make package-release
-      # How much room is left in each cardengine window that carries the reader.
-      # The linker scripts already fail the build if it runs out; this is so the
-      # margin is visible while it is still a margin, on the pinned toolchain rather
-      # than whatever a developer happens to have installed.
+
+      - name: Baixa a imagem do devkitARM
+        run: docker pull "$DEVKITARM_IMAGE"
+
+      - name: Build (nightly ou release) dentro do devkitARM
+        env:
+          TARGET: ${{ startsWith(github.ref, 'refs/tags') && 'package-release' || 'package-nightly' }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work "$DEVKITARM_IMAGE" bash -euxc '
+            install -m 755 /work/lzss /usr/local/bin/lzss
+            git config --global --add safe.directory "*"
+            arm-none-eabi-gcc --version | head -1
+            # serial de proposito: "make -j" tem corrida entre sub-makes
+            make '"$TARGET"'
+          '
+          # os arquivos criados pelo container sao de root; libera para os passos seguintes
+          sudo chown -R "$(id -u):$(id -g)" .
+
       - name: Report cardengine space budget
         run: ./tools/ra_snapshot_addr.sh
-      - name: Pack 7z nightly
+
+      - name: Empacota (nightly)
         if: ${{ !startsWith(github.ref, 'refs/tags') }}
         run: |
           printf "${{ github.sha }}\n" >> bin/nightly-bootstrap.ver
           mv bin/ nds-bootstrap/
-          7z a nds-bootstrap.7z nds-bootstrap/
-
           mkdir -p ~/artifacts
-          cp nds-bootstrap.7z ~/artifacts
-      - name: Pack 7z release
+          zip -r ~/artifacts/nds-bootstrap.zip nds-bootstrap/
+          command -v 7z >/dev/null && 7z a ~/artifacts/nds-bootstrap.7z nds-bootstrap/ || true
+
+      - name: Empacota (release)
         if: ${{ startsWith(github.ref, 'refs/tags') }}
         run: |
           printf "Release ${{ github.ref_name }}\n" >> bin/release-bootstrap.ver
-          cd bin
           mkdir -p ~/artifacts
+          (cd bin && zip -r ~/artifacts/nds-bootstrap.zip .)
+          (cd bin && command -v 7z >/dev/null && 7z a ~/artifacts/nds-bootstrap.7z . || true)
 
-          7z a nds-bootstrap.7z .
-          cp nds-bootstrap.7z ~/artifacts
-          rm nds-bootstrap.7z
-
-          7z a nds-bootstrap.zip .
-          cp nds-bootstrap.zip ~/artifacts
       - name: Publish build to GH Actions
         uses: actions/upload-artifact@v4
         with:
           path: ~/artifacts/*
           name: build
+
+      # Se falhar, guarda os logs/mapas para diagnostico
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-maps
+          path: |
+            **/*.map
+          if-no-files-found: ignore
 
   # Only run this for non-PR jobs.
   publish_build:
