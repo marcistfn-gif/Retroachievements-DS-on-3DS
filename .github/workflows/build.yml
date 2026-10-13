@@ -56,8 +56,17 @@ jobs:
             install -m 755 /work/lzss /usr/local/bin/lzss
             git config --global --add safe.directory "*"
             arm-none-eabi-gcc --version | head -1
+            # RA_LAUNCHER_WIFI=2 = build COM REDE (login, download das conquistas, envio).
+            # Sem isso o launcher sai sem WiFi e nada sincroniza com a conta.
             # serial de proposito: "make -j" tem corrida entre sub-makes
-            make '"$TARGET"'
+            make '"$TARGET"' RA_LAUNCHER_WIFI=2
+            # Prova tirada do binario: um launcher com rede liga o dsiwifi no ARM7.
+            ELF=$(ls retail/arm7/*.elf | head -n1)
+            WIFI=$(arm-none-eabi-nm "$ELF" | grep -ci "dsiwifi\|wifi_" || true)
+            echo "ARM7 wifi symbols: $WIFI ($ELF)"
+            if [ "$WIFI" -lt 20 ]; then
+              echo "ERRO: este NAO e um build com rede (RA_LAUNCHER_WIFI=2)"; exit 1
+            fi
           '
           # os arquivos criados pelo container sao de root; libera para os passos seguintes
           sudo chown -R "$(id -u):$(id -g)" .
